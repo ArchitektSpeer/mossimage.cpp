@@ -335,6 +335,17 @@ Edit adapters (`MI_CAP_REFERENCE_IMAGES`; moss-edit-lora files such as `chinoll/
 
 `MI_TEXT_REFERENCES` gives the report's `references` object as JSON ("" when none ran); `MI_MESSAGE_REFERENCE_WARNING` warns about references without a moss-edit-lora adapter and an edit adapter without references. Reference images are `mi_generate()`'s only: a session's `plan_request` with them is `MI_ERR_INVALID_ARGUMENT`.
 
+### Vision references
+
+MOSS-Image's text encoder, Qwen3.5-9B, is a vision-language model. With vision references (`MI_CAP_VISION_REFERENCES`) its vision tower turns each of `vision_images` (at most 4, RGB) into prompt tokens that are placed at the start of the prompt, as ComfyUI-MOSSImageTextEncoder does: `<|vision_start|>`, one `<|image_pad|>` per token, `<|vision_end|>` per image, right after the template's `<|im_start|>user\n`. The DiT then conditions on the encoder's output as for any prompt, so the image steers the generation with no adapter. It is not an edit: nothing of the image's pixels is kept.
+
+- **Size.** Each image is resized (PIL Lanczos) to fit `vision_max_pixels` (default 100000) keeping its aspect ratio, never upscaled, each side a multiple of 32; it then takes one token per 32×32 pixels (about 90 at the default). The prompt with its images must fit `max_sequence_length`.
+- **What it carries.** A character portrait at the default size carries the character (hair, face, glasses, clothes) into the scene the prompt describes. A whole scene, or a large `vision_max_pixels`, puts many image tokens against few prompt tokens and tends to reproduce the scene instead (`tools/vision_ref/README.md` has the measurements).
+- **Weight.** `vision_weight` (0..2, default 1) fades each image toward gray before the tower (below 1: less influence; 0 drops the images), as the ComfyUI node's `image_weight`. `vision_in_negative` 1 gives the negative prompt the same images, which lessens their pull under CFG.
+- **Arithmetic.** The tower (27 blocks of 1152, 2-D rotary over 72-dim heads, the 2×2 merger to 4096) runs in bf16; the file's INT8 ConvRot linears stay INT8 on the device and are dequantized one at a time before their GEMM, so it takes about 0.5 GB of the text encoder's phase. A sequence with images gets the interleaved mRoPE of `Qwen3_5Model.get_rope_index`; text-only sequences are unchanged bit for bit. Against transformers (`tests/unit/test_qwen35_vision.cpp`): the tower is within cosine 0.996 of its fp32 run, the whole conditioning within mean cosine 0.986 of `Qwen3_5Model` in bf16.
+- **Cache.** The embedding cache keys a sequence with images on the images' patches too.
+- **Needs** a single-file text encoder that carries the tower (`model.visual.*`, as Comfy-Org's `qwen3.5_9b_int8_convrot` and `qwen3.5_9b_w4a8_gptq`); `mi_generate()` fails with `MI_ERR_INVALID_ARGUMENT` otherwise. `mi_generate()` only (the component API's `encode_text` takes text).
+
 ### Accelerators
 
 The accelerators (`MI_CAP_ACCEL`) are lossy and opt-in, and off by default. They change the image; the tier is resolved as if they were off. They apply to each sampling pass (a hires fix's too). It is the same engine path as `moss-infer generate --cfg-truncation` / `--step-cache`.

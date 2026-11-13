@@ -195,7 +195,20 @@ struct Request {
     int max_edge = 512;  // [16, 2048], floored to a multiple of 16; the training used 256, the authors' workflow 512
     bool enabled() const { return !images.empty(); }
   } references;
+
+  // Vision references (MI_CAP_VISION_REFERENCES): images the text encoder's vision tower puts at the start of the
+  // prompt (models/qwen35_vision), each resized to fit max_pixels (Lanczos, sides on the 32-px grid). The negative
+  // prompt gets them too only with in_negative. Needs a text encoder file that carries the tower. Empty: none.
+  struct VisionReferences {
+    std::vector<std::shared_ptr<const Image>> images;
+    std::int64_t max_pixels = 100'000;  // [1024, 4194304]
+    float weight = 1.0f;                // [0, 2]; 0 drops the images
+    bool in_negative = false;
+    bool enabled() const { return !images.empty() && weight > 0.0f; }
+  } vision;
 };
+
+inline constexpr int kMaxVisionImages = 4;
 
 inline constexpr int kMaxReferenceImages = 4;
 inline constexpr std::int64_t kMaxReferenceTokens = 16384;  // moss_dit::kMaxReferenceTokens

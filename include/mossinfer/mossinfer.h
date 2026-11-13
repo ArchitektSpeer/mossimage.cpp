@@ -157,6 +157,10 @@ MOSSINFER_API const char* mi_last_error_message(void);
 /* mi_check() (a dry run of an engine configuration and a request), and the job's time estimate before it starts: the
  * "estimate" object of the plan callback's plan_json. */
 #define MI_CAP_CHECK 0x100000u
+/* Vision references: images the text encoder's vision tower (Qwen3.5) puts into the prompt (mi_gen_params.vision_*),
+ * so a reference image conditions the generation through the prompt, with no adapter. Needs a text encoder file that
+ * carries the tower (Comfy-Org's qwen3.5_9b_*.safetensors). */
+#define MI_CAP_VISION_REFERENCES 0x200000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -651,6 +655,17 @@ typedef struct mi_gen_params {
   int32_t _reserved5;               /* must be 0 */
   mi_lora_placement lora_placement; /* default MI_LORA_PLACEMENT_DEFAULT */
   int32_t _reserved6;               /* must be 0 */
+  /* Fields after the 408-byte layout (2.3). Vision references (MI_CAP_VISION_REFERENCES): at most 4 images, in order,
+   * each put through the text encoder's vision tower and placed at the start of the prompt (one prompt token per 32x32
+   * pixels), as ComfyUI-MOSSImageTextEncoder does. A character portrait at the default size carries the character; a
+   * whole scene, or a large size, tends to take over the image. Read during the call only. Default none. */
+  const mi_reference_image* vision_images;
+  size_t vision_images_count;
+  int64_t vision_max_pixels;   /* 0 (default) = 100000 (~90 prompt tokens); else 1024..4194304, never upscaled */
+  double vision_weight;        /* default 1; 0..2: below 1 fades the images toward gray (less influence), above 1 the
+                                * opposite; 0 drops them */
+  int32_t vision_in_negative;  /* 1: the negative prompt gets the images too (lessens their pull); default 0 */
+  int32_t _reserved7;          /* must be 0 */
 } mi_gen_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the

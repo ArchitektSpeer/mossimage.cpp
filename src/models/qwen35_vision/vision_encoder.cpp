@@ -309,9 +309,14 @@ VisionEncoder::VisionEncoder(const std::filesystem::path& te_file) : impl_(std::
 
 VisionEncoder::~VisionEncoder() = default;
 
-std::size_t VisionEncoder::workspace_bytes(std::int64_t patches) const {
-  std::size_t weights = 0;
-  for (const auto& [name, t] : impl_->tensors) weights += runtime::align_up(t.bytes.size(), runtime::kArenaAlign);
+std::size_t VisionEncoder::workspace_bytes(std::int64_t patches) {
+  // Weights as stored: the blocks' linears INT8 (+ f32 scales, bf16 biases), the rest bf16 (bf16 linears counted at
+  // two bytes per weight bound an all-bf16 file too), each tensor aligned.
+  const auto lin = [](std::size_t n, std::size_t k) { return n * k * 2 + n * 4 + n * 2 + 3 * runtime::kArenaAlign; };
+  std::size_t weights = kDepth * (lin(3 * kDim, kDim) + lin(kDim, kDim) + lin(kMlp, kDim) + lin(kDim, kMlp) +
+                                  4 * (kDim * 2 + runtime::kArenaAlign));
+  weights += lin(kDim * 4, kDim * 4) + lin(kOut, kDim * 4) + 2 * (kDim * 2 + runtime::kArenaAlign);
+  weights += static_cast<std::size_t>(kDim) * kPatchInput * 2 + kDim * 2 + 2 * runtime::kArenaAlign;
   const auto n = static_cast<std::size_t>(patches);
   const std::size_t act = n * (kDim * 2 /*x*/ + kDim * 2 /*h*/ + 3 * kDim * 2 /*qkv*/ + 3 * 16 * 128 * 2 /*q,k,v pad*/ +
                                16 * 128 * 2 /*attn*/ + kMlp * 2 /*mlp*/ + 72 * 4 * 2 /*cos, sin*/ + kPatchInput * 2) +

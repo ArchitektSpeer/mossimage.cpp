@@ -299,7 +299,8 @@ class CpuProtocolTest(ProtocolTestBase):
                                                "system_cuda": True, "control": True, "accel": True,
                                                "preload": True, "release": True, "certificate_dirs": False,
                                                "te_host_pin": True, "progress_fraction": True, "inspect": True,
-                                               "references": True, "check": True, "components": True})
+                                               "references": True, "check": True, "components": True,
+                                               "vision_references": True})
         self.assertEqual(set(res["values"]), {"mode", "block_path", "tier", "attention", "dit_direct_io", "te_host_pin",
                                               "sampler", "scheduler", "noise_layout", "noise_source", "resize",
                                               "mask_encoding", "step_cache", "lora_placement", "guidance", "output",

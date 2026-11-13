@@ -371,6 +371,19 @@ Image reference_pixels(const Image& image, int max_edge) {
 
 void validate(const Request& r) {
   if (tok::python_strip(r.prompt).empty()) throw std::invalid_argument("Enter a prompt.");
+  if (r.vision.images.size() > static_cast<std::size_t>(kMaxVisionImages)) {
+    throw std::invalid_argument("At most " + std::to_string(kMaxVisionImages) + " vision reference images.");
+  }
+  if (r.vision.max_pixels < 1024 || r.vision.max_pixels > 4194304) {
+    throw std::invalid_argument("The vision references' pixel cap must be 1024 to 4194304.");
+  }
+  if (!(r.vision.weight >= 0.0f && r.vision.weight <= 2.0f)) throw std::invalid_argument("The vision weight must be 0 to 2.");
+  for (std::size_t i = 0; i < r.vision.images.size(); ++i) {
+    const Image* im = r.vision.images[i].get();
+    if (im == nullptr || im->channels != 3) {
+      throw std::invalid_argument("Vision reference " + std::to_string(i + 1) + " must be an RGB image.");
+    }
+  }
   if (r.height <= 0 || r.width <= 0 || r.height % 16 != 0 || r.width % 16 != 0) {
     throw std::invalid_argument("Height and width must be positive multiples of 16.");
   }
@@ -1211,7 +1224,7 @@ Pipeline::Impl::Planned Pipeline::Impl::plan_call(const CallModels& models, cons
   in.request.dit_weights_cached = m.dit_weights_cached();
   in.request.vae_resident = needed_vae + held_vae > 0;
   in.workspaces.text_encoder = [&](planner::TeResidency residency, int buffers) {
-    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers, false));
+    return m.te_workspace(tes, te_lengths, m.te_options(tes, residency, buffers, false)) + c.vision_bytes;
   };
   in.workspaces.denoise = c.denoise;
   if (need_decoder) {
@@ -1694,6 +1707,28 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
     seqs.push_back(tok::encode_moss_prompt_report(b.tokenizer, req.negative_prompt,
                                                   static_cast<std::size_t>(req.max_sequence_length), r.uncond_token_report));
   }
+  // Vision references: the images go through the vision tower later (with the text encoder); here they take their
+  // places in the prompt (and in the negative prompt with in_negative).
+  std::vector<qwen35_vision::Prepared> vision_images;
+  std::vector<qwen35_vision::VisionPrompt> vision_prompts(seqs.size());
+  std::int64_t vision_patches = 0;
+  if (req.vision.enabled()) {
+    if (!tes.model) {
+      throw std::invalid_argument("Vision references need a text encoder file that carries the vision tower (Comfy-Org's "
+                                  "qwen3.5_9b_*.safetensors as text_encoder_file).");
+    }
+    for (const auto& im : req.vision.images) {
+      vision_images.push_back(qwen35_vision::prepare(*im, req.vision.max_pixels, req.vision.weight));
+      vision_patches += std::int64_t{vision_images.back().grid_h} * vision_images.back().grid_w;
+    }
+    const auto max_len = static_cast<std::size_t>(req.max_sequence_length);
+    vision_prompts[0] = qwen35_vision::build_prompt(b.tokenizer, req.prompt, vision_images, max_len);
+    seqs[0] = vision_prompts[0].ids;
+    if (g.do_cfg() && req.vision.in_negative) {
+      vision_prompts[1] = qwen35_vision::build_prompt(b.tokenizer, req.negative_prompt, vision_images, max_len);
+      seqs[1] = vision_prompts[1].ids;
+    }
+  }
   tm.tokenize_s = since(t0);
   const std::int64_t sc = static_cast<std::int64_t>(seqs[0].size());
   const std::int64_t su = g.do_cfg() ? static_cast<std::int64_t>(seqs[1].size()) : 0;
@@ -1708,6 +1743,13 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   std::vector<std::size_t> missing;
   for (std::size_t i = 0; i < seqs.size(); ++i) {
     keys[i] = EmbeddingKey{tes.identity, tes.numerics, req.max_sequence_length, seqs[i]};
+    if (!vision_prompts[i].ids.empty()) {
+      // The placeholders are the same for any image: the key's model identity also carries the images' patches (their
+      // pixels, size and weight), so each set of images has its own entries (the tokens must stay the sequence's).
+      std::uint64_t h = keys[i].model_hash;
+      for (const auto& im : vision_images) h = xxh64(im.patches.data(), im.patches.size() * 2, h);
+      keys[i].model_hash = h;
+    }
     if (m.cache && need_dit && !preload) embeds[i] = m.cache->find(keys[i]);  // a preload plans for a new prompt
     if (embeds[i]) {
       ++r.te_cache_hits;
@@ -1797,6 +1839,10 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
     pc.reference_prefills = (sched1.num_steps() > 0 ? 1 : 0) + (hires && sched2.num_steps() > 0 ? 1 : 0);
   }
   pc.te_lengths = te_lengths;
+  if (!vision_images.empty() && !te_lengths.empty()) {
+    pc.vision_bytes = qwen35_vision::VisionEncoder::workspace_bytes(vision_patches) +
+                      qwen35_text::TextEncoder::vision_workspace_bytes(te_lengths);
+  }
   pc.need_dit = need_dit;
   pc.encoder = enc_src;
   pc.decode_height = dec_h;
@@ -1943,6 +1989,36 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
     m.ensure_te(tes, m.te_options(tes, plan.te.residency, plan.te.buffers, plan.te.pinned));
     qwen35_text::EncodeOptions eo;
     eo.cancel = control.cancel;
+    // Vision references: the tower runs first; its tokens stay on the stack (below the encoder's scratch) until the
+    // text encoder has used them.
+    std::optional<runtime::StackScope> vision_scope;
+    std::vector<qwen35_text::SequenceVision> vision_rows;
+    if (!vision_images.empty() && std::any_of(missing.begin(), missing.end(), [&](std::size_t i) { return !vision_prompts[i].ids.empty(); })) {
+      const auto tv = Clock::now();
+      if (!m.vision || m.vision_path != tes.path) {
+        m.vision.reset();
+        m.vision = std::make_unique<qwen35_vision::VisionEncoder>(tes.path);
+        m.vision_path = tes.path;
+      }
+      vision_scope.emplace(*m.arena);
+      const Tensor tokens = m.vision->encode(vision_images, *m.arena, m.streams.compute());
+      vision_rows.resize(missing.size());
+      for (std::size_t k = 0; k < missing.size(); ++k) {
+        const auto& vp = vision_prompts[missing[k]];
+        if (vp.ids.empty()) continue;
+        std::int64_t off = 0;
+        for (std::size_t j = 0; j < vision_images.size(); ++j) {
+          const std::int64_t n = vision_images[j].tokens();
+          vision_rows[k].rows.emplace_back(vp.starts[j], tokens.slice0(off, off + n));
+          off += n;
+        }
+        vision_rows[k].positions = vp.positions;
+      }
+      eo.vision = &vision_rows;
+      r.plan.explanation += "\nVision references: " + std::to_string(vision_images.size()) + " image(s), " +
+                            std::to_string(vision_prompts[0].ids.size() - static_cast<std::size_t>(r.cond_token_report.total_tokens)) +
+                            " prompt tokens, tower " + std::to_string(since(tv)).substr(0, 5) + " s.";
+    }
     std::vector<std::vector<std::uint16_t>> out;
     try {
       // A host-resident copy not loaded yet: loaded here, cancellable between layer groups (encode() would load it

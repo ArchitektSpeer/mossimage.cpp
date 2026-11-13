@@ -98,8 +98,9 @@ class VisionEncoder {
   VisionEncoder(const VisionEncoder&) = delete;
   VisionEncoder& operator=(const VisionEncoder&) = delete;
 
-  // Device bytes encode() takes from the arena stack for `patches` patches in all (weights, scratch and the output).
-  std::size_t workspace_bytes(std::int64_t patches) const;
+  // Device bytes encode() takes from the arena stack for `patches` patches in all (weights, scratch and the output),
+  // an upper bound from the architecture (the plan's figure before the file is read).
+  static std::size_t workspace_bytes(std::int64_t patches);
 
   // The tokens of every image, bf16 [sum of tokens(), 4096], in order. The output is allocated on the arena stack
   // below encode()'s scratch, which is released before returning (TextEncoder::encode's convention). Synchronizes

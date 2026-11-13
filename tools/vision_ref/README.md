@@ -21,7 +21,14 @@ whether it is worth building.
 So the feature is worth building, for character references: a portrait crop and a small token budget (about 0.1 MP)
 by default. A front end should ask for character portraits, not scenes.
 
-## What an engine implementation needs
+## In the engine
+
+`generate`'s `vision_references` (`MI_CAP_VISION_REFERENCES`; [c-api.md](../../docs/c-api.md#vision-references)) is this,
+checked against these scripts by `tests/unit/test_qwen35_vision.cpp` (set `MOSS_VISION_*` as its header says). On the
+test image, `generate` with the image gives the same picture, bit for bit, as this loop drawing the engine's own
+conditioning.
+
+## What the engine implementation needed
 
 - The vision tower: patch embedding (Conv3d 3×2×16×16 as a GEMM), bilinear position embedding from a 48×48 table, 27 blocks (LayerNorm with bias, qkv with bias, 2-D rotary over head dim 72, bidirectional attention per image, GELU-tanh MLP 1152→4304), the 2×2 merger (LayerNorm, 4608→4608 GELU, →4096). Linear weights are INT8 ConvRot with group 64 (the text encoder's are 256).
 - The text encoder: image placeholder rows replaced by the vision output; interleaved mRoPE for image tokens (sections 11, 11, 10; text tokens keep equal t, h, w), continuing positions after the image from its largest position + 1; the embedding cache keyed on the images too.

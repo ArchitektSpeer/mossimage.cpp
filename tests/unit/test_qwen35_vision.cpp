@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <filesystem>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +39,40 @@ TEST(Qwen35Vision, FitSizeKeepsTheAspectRatioOnTheMergeGridAndNeverUpscales) {
   EXPECT_EQ(w % 32, 0);
   EXPECT_EQ(h % 32, 0);
   EXPECT_THROW(fit_size(0, 10, 100), std::invalid_argument);
+}
+
+TEST(Qwen35Vision, ImagesHashTellsGridsApartWithTheSamePatches) {
+  // A flat colour at 64x128 and at 128x64: the same 32 patch rows, other position embeddings and mRoPE positions.
+  Prepared tall, wide;
+  tall.grid_h = 8;
+  tall.grid_w = 4;
+  wide.grid_h = 4;
+  wide.grid_w = 8;
+  tall.patches.assign(32u * kPatchInput, 0x3f80);
+  wide.patches = tall.patches;
+  EXPECT_NE(images_hash({tall}, 7), images_hash({wide}, 7));
+  EXPECT_EQ(images_hash({tall}, 7), images_hash({tall}, 7));
+  EXPECT_NE(images_hash({tall, wide}, 7), images_hash({wide, tall}, 7));  // order counts
+  EXPECT_NE(images_hash({tall}, 7), images_hash({tall}, 8));              // the model's own identity is kept
+}
+
+TEST(Qwen35Vision, AvailableOnlyForAFileWithTheTower) {
+  // A minimal safetensors file holding one text-encoder tensor and no model.visual.*: not usable for vision references.
+  const auto dir = std::filesystem::temp_directory_path() / ("mi_vision_avail_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+  std::filesystem::create_directories(dir);
+  const auto write = [&](const std::string& name, const std::string& tensor) {
+    const std::string header = "{\"" + tensor + "\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[0,4]}}";
+    std::ofstream o(dir / name, std::ios::binary);
+    const std::uint64_t n = header.size();
+    o.write(reinterpret_cast<const char*>(&n), 8);
+    o << header;
+    o.write("\0\0\0\0", 4);
+    return dir / name;
+  };
+  EXPECT_FALSE(VisionEncoder::available(write("text_only.safetensors", "model.language_model.norm.weight")));
+  EXPECT_TRUE(VisionEncoder::available(write("with_tower.safetensors", "model.visual.merger.norm.bias")));
+  EXPECT_FALSE(VisionEncoder::available(dir / "absent.safetensors"));
+  std::filesystem::remove_all(dir);
 }
 
 TEST(Qwen35Vision, MropePositionsMatchTransformersGetRopeIndex) {

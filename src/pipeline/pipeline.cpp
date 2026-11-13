@@ -1713,7 +1713,8 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   std::vector<qwen35_vision::VisionPrompt> vision_prompts(seqs.size());
   std::int64_t vision_patches = 0;
   if (req.vision.enabled()) {
-    if (!tes.model) {
+    // Checked before anything is planned or loaded, so check() and preload() refuse it as generate() would.
+    if (!tes.model || !m.vision_available(tes.path)) {
       throw std::invalid_argument("Vision references need a text encoder file that carries the vision tower (Comfy-Org's "
                                   "qwen3.5_9b_*.safetensors as text_encoder_file).");
     }
@@ -1744,11 +1745,9 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   for (std::size_t i = 0; i < seqs.size(); ++i) {
     keys[i] = EmbeddingKey{tes.identity, tes.numerics, req.max_sequence_length, seqs[i]};
     if (!vision_prompts[i].ids.empty()) {
-      // The placeholders are the same for any image: the key's model identity also carries the images' patches (their
-      // pixels, size and weight), so each set of images has its own entries (the tokens must stay the sequence's).
-      std::uint64_t h = keys[i].model_hash;
-      for (const auto& im : vision_images) h = xxh64(im.patches.data(), im.patches.size() * 2, h);
-      keys[i].model_hash = h;
+      // The placeholders are the same for any image: the key's model identity also carries the images (their grids and
+      // patches: pixels, size and weight), so each set of images has its own entries (the tokens must stay the sequence's).
+      keys[i].model_hash = qwen35_vision::images_hash(vision_images, keys[i].model_hash);
     }
     if (m.cache && need_dit && !preload) embeds[i] = m.cache->find(keys[i]);  // a preload plans for a new prompt
     if (embeds[i]) {

@@ -56,6 +56,11 @@ struct Prepared {
   std::int64_t tokens() const { return static_cast<std::int64_t>(grid_h) * grid_w / (kMerge * kMerge); }
 };
 
+// What a set of prepared images contributes to an embedding cache key: every image's patch grid and patch values,
+// in order. The grid matters too: two images can have the same patch values on grids of other shapes (a flat
+// colour at 64x128 and at 128x64), and their position embeddings and mRoPE positions differ.
+std::uint64_t images_hash(const std::vector<Prepared>& images, std::uint64_t seed);
+
 // RGB image -> Prepared: Lanczos resize to fit_size, rescale to [0, 1], `weight` (0.5 + weight * (x - 0.5): < 1 fades
 // the image toward gray, which the tower reads as no signal), normalize with mean = std = 0.5, the temporal pair (a
 // still image is its own second frame), and the patch order of Qwen2VLImageProcessor.

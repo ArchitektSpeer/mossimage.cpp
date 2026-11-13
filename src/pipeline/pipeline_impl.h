@@ -471,6 +471,13 @@ struct Pipeline::Impl {
   // Vision references: the tower of the text encoder file at vision_path (host weights; device memory per encode).
   std::unique_ptr<qwen35_vision::VisionEncoder> vision;
   std::filesystem::path vision_path;
+  // Whether a text encoder file carries the vision tower (its header read once per path).
+  std::map<std::filesystem::path, bool> vision_files;
+  bool vision_available(const std::filesystem::path& te_file) {
+    const auto it = vision_files.find(te_file);
+    if (it != vision_files.end()) return it->second;
+    return vision_files[te_file] = qwen35_vision::VisionEncoder::available(te_file);
+  }
   const TeSource* te_src = nullptr;
   std::map<std::string, std::unique_ptr<TeSource>> te_sources;
   std::unique_ptr<moss_dit::MossDit> dit;

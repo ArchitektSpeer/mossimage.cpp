@@ -14,6 +14,7 @@
 #include "kernels/basic/elementwise.h"
 #include "kernels/basic/gemm.h"
 #include "kernels/vision/vision.h"
+#include "util/xxh64.h"
 #include "weights/safetensors.h"
 
 namespace mi::qwen35_vision {
@@ -100,6 +101,16 @@ std::pair<int, int> fit_size(int width, int height, std::int64_t max_pixels) {
     else w -= kGrid;
   }
   return {w, h};
+}
+
+std::uint64_t images_hash(const std::vector<Prepared>& images, std::uint64_t seed) {
+  std::uint64_t h = seed;
+  for (const Prepared& im : images) {
+    const std::int32_t grid[2] = {im.grid_h, im.grid_w};
+    h = xxh64(grid, sizeof grid, h);
+    h = xxh64(im.patches.data(), im.patches.size() * sizeof(std::uint16_t), h);
+  }
+  return h;
 }
 
 Prepared prepare(const pipeline::Image& rgb, std::int64_t max_pixels, float weight) {

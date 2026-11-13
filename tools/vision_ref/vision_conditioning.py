@@ -136,7 +136,7 @@ def preprocess(path: str, max_pixels: int, weight: float) -> tuple[torch.Tensor,
         image = Image.alpha_composite(white, image)
     image = image.convert("RGB")
     h, w = smart_resize(image.height, image.width, max_pixels)
-    image = image.resize((w, h), Image.BICUBIC)
+    image = image.resize((w, h), Image.LANCZOS)
     x = torch.from_numpy(__import__("numpy").asarray(image, dtype="float32") / 255.0).permute(2, 0, 1)  # [3, h, w]
     if weight != 1.0:  # fade toward (or push away from) gray, which the tower reads as no signal
         x = (0.5 + weight * (x - 0.5)).clamp(0, 1)
@@ -159,6 +159,7 @@ def main() -> None:
     ap.add_argument("--image-weight", type=float, default=1.0)
     ap.add_argument("--megapixels", type=float, default=1.0)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--dump-vision", help="also write the vision tower's merged tokens [N, 4096] here")
     args = ap.parse_args()
     device = "cuda"
     t0 = time.time()
@@ -220,6 +221,10 @@ def main() -> None:
             "image_grid_thw": torch.tensor(grids, device=device),
             "mm_token_type_ids": mm,
         }
+    if args.dump_vision and pixel_values:
+        with torch.no_grad():
+            vis = model.visual(kwargs["pixel_values"], grid_thw=kwargs["image_grid_thw"]).pooler_output
+        save_file({"vision": vis.to(torch.bfloat16).contiguous().cpu(), "patches": kwargs["pixel_values"].cpu().contiguous()}, args.dump_vision)
     with torch.no_grad():
         out = model(input_ids=ids, use_cache=False, **kwargs).last_hidden_state[0]
     save_file({"conditioning": out.to(torch.bfloat16).contiguous().cpu()}, args.out)

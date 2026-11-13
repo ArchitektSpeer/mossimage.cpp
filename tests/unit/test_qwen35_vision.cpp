@@ -148,3 +148,114 @@ TEST(Qwen35Vision, TowerMatchesTransformersOnARealImage) {
 }
 
 }  // namespace
+
+#include "models/qwen35_text/quant_text_model.h"
+#include "models/qwen35_text/text_encoder.h"
+
+namespace {
+
+// The whole conditioning: tokens, the tower, the image rows and mRoPE in the text encoder, against transformers'
+// Qwen3_5Model (tools/vision_ref/vision_conditioning.py --prompt x --image <MOSS_VISION_IMAGE> --megapixels 0.095,
+// written to MOSS_VISION_COND), with the bundle's tokenizer.json in MOSS_VISION_TOKENIZER.
+TEST(Qwen35Vision, ConditioningMatchesTransformersQwen3_5Model) {
+  const char* te = std::getenv("MOSS_VISION_TE");
+  const char* image = std::getenv("MOSS_VISION_IMAGE");
+  const char* cond = std::getenv("MOSS_VISION_COND");
+  const char* tokenizer_json = std::getenv("MOSS_VISION_TOKENIZER");
+  if (!te || !image || !cond || !tokenizer_json) GTEST_SKIP() << "set MOSS_VISION_TE, _IMAGE, _COND and _TOKENIZER";
+  const auto tokenizer = mi::tok::Tokenizer::load(tokenizer_json);
+  const Prepared prepared = prepare(mi::pipeline::load_image(image), kDefaultMaxPixels, 1.0f);
+  const char* prompt_env = std::getenv("MOSS_VISION_PROMPT");
+  const std::string prompt = prompt_env ? prompt_env : "x";
+  const VisionPrompt vp = build_prompt(tokenizer, prompt, {prepared}, 4096);
+  ASSERT_EQ(vp.starts.size(), 1u);
+  EXPECT_EQ(vp.ids[static_cast<std::size_t>(vp.starts[0]) - 1], tokenizer.encode("<|vision_start|>")[0]);
+
+  mi::qwen35_text::QuantTextModel model(te);
+  VisionEncoder vision(te);
+  const std::vector<std::int64_t> lengths{static_cast<std::int64_t>(vp.ids.size())};
+  mi::qwen35_text::EncoderOptions eo;
+  mi::runtime::DeviceArena arena(mi::qwen35_text::TextEncoder::workspace_bytes(model, lengths, eo) +
+                                 mi::qwen35_text::TextEncoder::vision_workspace_bytes(lengths) +
+                                 vision.workspace_bytes(static_cast<std::int64_t>(prepared.grid_h) * prepared.grid_w));
+  cudaStream_t stream = nullptr;
+  mi::runtime::StackScope scope(arena);
+  const mi::Tensor rows = vision.encode({prepared}, arena, stream);
+  mi::qwen35_text::TextEncoder encoder(model, arena, stream, eo);
+  std::vector<mi::qwen35_text::SequenceVision> sv(1);
+  sv[0].rows.emplace_back(vp.starts[0], rows);
+  sv[0].positions = vp.positions;
+  mi::qwen35_text::EncodeOptions opts;
+  opts.vision = &sv;
+  const auto got = encoder.encode_to_host({vp.ids}, opts)[0];
+  if (const char* dump = std::getenv("MOSS_VISION_DUMP")) {  // the engine's conditioning, for drawing it
+    const std::string header = "{\"conditioning\":{\"dtype\":\"BF16\",\"shape\":[" + std::to_string(got.size() / 4096) +
+                               ",4096],\"data_offsets\":[0," + std::to_string(got.size() * 2) + "]}}";
+    std::ofstream o(dump, std::ios::binary);
+    const std::uint64_t n = header.size();
+    o.write(reinterpret_cast<const char*>(&n), 8);
+    o << header;
+    o.write(reinterpret_cast<const char*>(got.data()), static_cast<std::streamsize>(got.size() * 2));
+  }
+  mi::weights::SafetensorsFile f(cond);
+  const auto* t = f.find("conditioning");
+  ASSERT_NE(t, nullptr);
+  ASSERT_EQ(t->nbytes, got.size() * 2) << "token counts differ";
+  std::vector<std::uint16_t> want(got.size());
+  std::ifstream in(cond, std::ios::binary);
+  in.seekg(static_cast<std::streamoff>(t->offset));
+  in.read(reinterpret_cast<char*>(want.data()), static_cast<std::streamsize>(t->nbytes));
+  // The engine runs the decoder's GEMMs in INT8 with per-token activations, the reference in bf16 with dequantized
+  // weights. Text tokens agree to cosine 0.998 as on text-only prompts; a few image tokens, whose activations have
+  // larger outliers, drift further (worst 0.69 on the test image) without changing the image drawn from them: the
+  // engine's and transformers' conditionings give the same composition and character (checked by eye, PSNR 15 dB).
+  // So the bound is on the mean and the overall error, not the worst token.
+  double worst = 1, mean = 0, num = 0, den = 0;
+  const std::size_t n = got.size() / mi::qwen35_text::kHidden;
+  for (std::size_t r = 0; r < n; ++r) {
+    double dot = 0, a2 = 0, b2 = 0;
+    for (int d = 0; d < mi::qwen35_text::kHidden; ++d) {
+      const double a = bf16_to_float(got[r * mi::qwen35_text::kHidden + static_cast<std::size_t>(d)]);
+      const double b = bf16_to_float(want[r * mi::qwen35_text::kHidden + static_cast<std::size_t>(d)]);
+      dot += a * b;
+      a2 += a * a;
+      b2 += b * b;
+      num += (a - b) * (a - b);
+      den += b * b;
+    }
+    worst = std::min(worst, dot / std::sqrt(a2 * b2));
+    mean += dot / std::sqrt(a2 * b2) / static_cast<double>(got.size() / mi::qwen35_text::kHidden);
+  }
+  std::printf("conditioning vs transformers: %zu tokens, mean cosine %.4f, worst %.4f, relative L2 %.4f\n", n, mean, worst,
+              std::sqrt(num / den));
+  EXPECT_GT(mean, 0.97);
+  EXPECT_LT(std::sqrt(num / den), 0.25);
+}
+
+}  // namespace
+
+namespace {
+
+// Text-only sequences through the vision path (mRoPE table from equal positions, no rows) give the plain path's bits:
+// prompts without images are untouched by the feature.
+TEST(Qwen35Vision, TextOnlyThroughTheVisionPathIsBitIdentical) {
+  const char* te = std::getenv("MOSS_VISION_TE");
+  const char* tokenizer_json = std::getenv("MOSS_VISION_TOKENIZER");
+  if (!te || !tokenizer_json) GTEST_SKIP() << "set MOSS_VISION_TE and MOSS_VISION_TOKENIZER";
+  const auto tokenizer = mi::tok::Tokenizer::load(tokenizer_json);
+  const VisionPrompt vp = build_prompt(tokenizer, "一只橘猫坐在雨夜的木箱上", {}, 4096);
+  EXPECT_EQ(vp.ids, mi::tok::encode_moss_prompt(tokenizer, "一只橘猫坐在雨夜的木箱上", 4096));
+  mi::qwen35_text::QuantTextModel model(te);
+  const std::vector<std::int64_t> lengths{static_cast<std::int64_t>(vp.ids.size())};
+  mi::runtime::DeviceArena arena(mi::qwen35_text::TextEncoder::workspace_bytes(model, lengths, {}) +
+                                 mi::qwen35_text::TextEncoder::vision_workspace_bytes(lengths));
+  mi::qwen35_text::TextEncoder encoder(model, arena, nullptr, {});
+  const auto plain = encoder.encode_to_host({vp.ids}, {})[0];
+  std::vector<mi::qwen35_text::SequenceVision> sv(1);
+  sv[0].positions = vp.positions;
+  mi::qwen35_text::EncodeOptions opts;
+  opts.vision = &sv;
+  EXPECT_EQ(encoder.encode_to_host({vp.ids}, opts)[0], plain);
+}
+
+}  // namespace

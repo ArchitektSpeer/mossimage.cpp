@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -179,6 +180,36 @@ std::vector<std::vector<std::int32_t>> mrope_positions(std::int64_t length, cons
     next += std::max(gh, gw);
   }
   return pos;
+}
+
+VisionPrompt build_prompt(const tok::Tokenizer& tokenizer, std::string_view prompt, const std::vector<Prepared>& images,
+                          std::size_t max_length) {
+  VisionPrompt p;
+  std::vector<std::int32_t> text = tok::encode_moss_prompt(tokenizer, prompt, std::numeric_limits<std::size_t>::max());
+  const std::size_t head = tokenizer.encode("<|im_start|>user\n").size();
+  const auto special = [&](const char* s) {
+    const auto ids = tokenizer.encode(s);
+    if (ids.size() != 1) throw std::runtime_error(std::string("qwen35_vision: the tokenizer has no ") + s + " token");
+    return ids[0];
+  };
+  const std::int32_t start = special("<|vision_start|>"), pad = special("<|image_pad|>"), end = special("<|vision_end|>");
+  p.ids.assign(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(head));
+  for (const Prepared& im : images) {
+    p.ids.push_back(start);
+    p.starts.push_back(static_cast<std::int64_t>(p.ids.size()));
+    p.merged_grids.emplace_back(im.grid_h / kMerge, im.grid_w / kMerge);
+    p.ids.insert(p.ids.end(), static_cast<std::size_t>(im.tokens()), pad);
+    p.ids.push_back(end);
+  }
+  p.ids.insert(p.ids.end(), text.begin() + static_cast<std::ptrdiff_t>(head), text.end());
+  if (p.ids.size() > max_length) {
+    throw std::invalid_argument("qwen35_vision: the prompt with its reference images is " + std::to_string(p.ids.size()) +
+                                " tokens, over the limit of " + std::to_string(max_length) +
+                                "; use smaller images (max_pixels) or a shorter prompt");
+  }
+  const auto pos = mrope_positions(static_cast<std::int64_t>(p.ids.size()), p.starts, p.merged_grids);
+  for (const auto& axis : pos) p.positions.insert(p.positions.end(), axis.begin(), axis.end());
+  return p;
 }
 
 struct VisionEncoder::Impl {

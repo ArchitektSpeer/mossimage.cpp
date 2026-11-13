@@ -26,6 +26,7 @@
 #include "core/tensor.h"
 #include "pipeline/pipeline_image.h"
 #include "runtime/device_arena.h"
+#include "tokenizer/qwen_bpe.h"
 
 namespace mi::qwen35_vision {
 
@@ -70,6 +71,20 @@ void rotary_tables(int grid_h, int grid_w, std::vector<float>& cos, std::vector<
 // Returns [3][length] positions (t, h, w).
 std::vector<std::vector<std::int32_t>> mrope_positions(std::int64_t length, const std::vector<std::int64_t>& image_starts,
                                                        const std::vector<std::pair<int, int>>& merged_grids);
+
+// A MOSS prompt with images in it, as ComfyUI-MOSSImageTextEncoder builds it: each image's
+// `<|vision_start|><|image_pad|>...<|vision_end|>` (one pad per merged token) right after "<|im_start|>user\n", in
+// order, then the prompt and the template's end.
+struct VisionPrompt {
+  std::vector<std::int32_t> ids;
+  std::vector<std::int64_t> starts;                 // index of each image's first pad
+  std::vector<std::pair<int, int>> merged_grids;    // each image's token grid (patch grid / 2)
+  std::vector<std::int32_t> positions;              // mRoPE [3 * ids.size()]: t, then h, then w
+};
+// Throws std::invalid_argument when the prompt with its images is longer than max_length (truncating would cut an
+// image apart) or the prompt is one the template rejects.
+VisionPrompt build_prompt(const tok::Tokenizer& tokenizer, std::string_view prompt, const std::vector<Prepared>& images,
+                          std::size_t max_length);
 
 class VisionEncoder {
  public:

@@ -192,6 +192,40 @@ namespace {
 // The whole conditioning: tokens, the tower, the image rows and mRoPE in the text encoder, against transformers'
 // Qwen3_5Model (tools/vision_ref/vision_conditioning.py --prompt x --image <MOSS_VISION_IMAGE> --megapixels 0.095,
 // written to MOSS_VISION_COND), with the bundle's tokenizer.json in MOSS_VISION_TOKENIZER.
+// The weights are the same for every grid, so the growth of the arena's peak between a small and a large grid is what
+// encode() really needs per patch; the estimate must grow at least as much. (An INT8 file needs less for its weights
+// than the estimate counts, which would hide a short activation count in a single run.)
+TEST(Qwen35Vision, WorkspaceEstimateCoversWhatEncodeHoldsPerPatch) {
+  const char* te = std::getenv("MOSS_VISION_TE");
+  if (!te) GTEST_SKIP() << "set MOSS_VISION_TE";
+  auto gray = [](int side) {
+    mi::pipeline::Image image;
+    image.width = image.height = side;
+    image.pixels.assign(static_cast<std::size_t>(side) * side * 3, 128);
+    return image;
+  };
+  const Prepared small = prepare(gray(256), kDefaultMaxPixels, 1.0f);
+  const Prepared large = prepare(gray(2048), 2048 * 2048, 1.0f);
+  const auto patches = [](const Prepared& p) { return static_cast<std::int64_t>(p.grid_h) * p.grid_w; };
+  ASSERT_GE(patches(large), 16 * patches(small));
+
+  VisionEncoder encoder(te);
+  mi::runtime::DeviceArena arena(VisionEncoder::workspace_bytes(patches(large)) + (std::size_t{64} << 20));
+  cudaStream_t stream = nullptr;
+  auto peak = [&](const Prepared& p) {
+    const std::size_t mark = arena.mark();
+    arena.reset_high_water();
+    const std::size_t before = arena.used();
+    (void)encoder.encode({p}, arena, stream);
+    const std::size_t used = arena.high_water() - before;
+    arena.rollback(mark);
+    return used;
+  };
+  const std::size_t small_peak = peak(small), large_peak = peak(large);
+  EXPECT_LE(large_peak - small_peak,
+            VisionEncoder::workspace_bytes(patches(large)) - VisionEncoder::workspace_bytes(patches(small)));
+}
+
 TEST(Qwen35Vision, ConditioningMatchesTransformersQwen3_5Model) {
   const char* te = std::getenv("MOSS_VISION_TE");
   const char* image = std::getenv("MOSS_VISION_IMAGE");

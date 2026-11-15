@@ -329,9 +329,12 @@ std::size_t VisionEncoder::workspace_bytes(std::int64_t patches) {
   weights += lin(kDim * 4, kDim * 4) + lin(kOut, kDim * 4) + 2 * (kDim * 2 + runtime::kArenaAlign);
   weights += static_cast<std::size_t>(kDim) * kPatchInput * 2 + kDim * 2 + 2 * runtime::kArenaAlign;
   const auto n = static_cast<std::size_t>(patches);
-  const std::size_t act = n * (kDim * 2 /*x*/ + kDim * 2 /*h*/ + 3 * kDim * 2 /*qkv*/ + 3 * 16 * 128 * 2 /*q,k,v pad*/ +
-                               16 * 128 * 2 /*attn*/ + kMlp * 2 /*mlp*/ + 72 * 4 * 2 /*cos, sin*/ + kPatchInput * 2) +
-                          n / 4 * (kDim * 4 * 2 * 2 + kOut * 2);
+  // Every buffer encode() holds at once: the uploads (patches, positions, rotary tables), the block buffers, and the
+  // merger's fc1 next to the output.
+  const std::size_t act = n * (kPatchInput * 2 /*px*/ + kDim * 2 /*pos*/ + 72 * 4 * 2 /*cos, sin*/ + kDim * 2 /*x*/ +
+                               kDim * 2 /*h*/ + kDim * 2 /*y*/ + 3 * kDim * 2 /*qkv*/ + 3 * 16 * 128 * 2 /*q,k,v pad*/ +
+                               16 * 128 * 2 /*attn*/ + kMlp * 2 /*mlp*/) +
+                          n / 4 * (kDim * 4 * 2 /*fc1*/ + kOut * 2 /*out*/);
   const std::size_t one_linear = static_cast<std::size_t>(kDim) * 4 * kDim * 4 * 2;  // the largest dequantized weight
   return weights + act + one_linear + kernels::Gemm::kWorkspaceBytes +
          attention::flash_fwd_workspace_bytes(patches, kernels::vision::kHeads) + (std::size_t{64} << 10) * 64;

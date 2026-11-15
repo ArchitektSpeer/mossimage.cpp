@@ -184,14 +184,6 @@ TEST(Qwen35Vision, TowerMatchesTransformersOnARealImage) {
 
 }  // namespace
 
-#include "models/qwen35_text/quant_text_model.h"
-#include "models/qwen35_text/text_encoder.h"
-
-namespace {
-
-// The whole conditioning: tokens, the tower, the image rows and mRoPE in the text encoder, against transformers'
-// Qwen3_5Model (tools/vision_ref/vision_conditioning.py --prompt x --image <MOSS_VISION_IMAGE> --megapixels 0.095,
-// written to MOSS_VISION_COND), with the bundle's tokenizer.json in MOSS_VISION_TOKENIZER.
 // The weights are the same for every grid, so the growth of the arena's peak between a small and a large grid is what
 // encode() really needs per patch; the estimate must grow at least as much. (An INT8 file needs less for its weights
 // than the estimate counts, which would hide a short activation count in a single run.)
@@ -226,6 +218,14 @@ TEST(Qwen35Vision, WorkspaceEstimateCoversWhatEncodeHoldsPerPatch) {
             VisionEncoder::workspace_bytes(patches(large)) - VisionEncoder::workspace_bytes(patches(small)));
 }
 
+#include "models/qwen35_text/quant_text_model.h"
+#include "models/qwen35_text/text_encoder.h"
+
+namespace {
+
+// The whole conditioning: tokens, the tower, the image rows and mRoPE in the text encoder, against transformers'
+// Qwen3_5Model (tools/vision_ref/vision_conditioning.py --prompt x --image <MOSS_VISION_IMAGE> --megapixels 0.095,
+// written to MOSS_VISION_COND), with the bundle's tokenizer.json in MOSS_VISION_TOKENIZER.
 TEST(Qwen35Vision, ConditioningMatchesTransformersQwen3_5Model) {
   const char* te = std::getenv("MOSS_VISION_TE");
   const char* image = std::getenv("MOSS_VISION_IMAGE");

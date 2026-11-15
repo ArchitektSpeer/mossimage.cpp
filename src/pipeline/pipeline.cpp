@@ -378,6 +378,17 @@ void validate(const Request& r) {
     throw std::invalid_argument("The vision references' pixel cap must be 1024 to 4194304.");
   }
   if (!(r.vision.weight >= 0.0f && r.vision.weight <= 2.0f)) throw std::invalid_argument("The vision weight must be 0 to 2.");
+  if (!(0.0 <= r.vision.start && r.vision.start <= r.vision.stop && r.vision.stop <= 1.0)) {
+    throw std::invalid_argument("Require 0 <= vision start <= vision stop <= 1.");
+  }
+  if (r.vision.guided() && r.slg_scale > 0) {
+    throw std::invalid_argument("A vision weight, start or stop does not work with an SLG row (slg_scale > 0); use "
+                                "uncond_skip_layers instead.");
+  }
+  if (r.vision.guided() && r.accel.step_cache_on()) {
+    throw std::invalid_argument("A vision weight, start or stop does not work with the step cache: the cond row changes "
+                                "between steps.");
+  }
   for (std::size_t i = 0; i < r.vision.images.size(); ++i) {
     const Image* im = r.vision.images[i].get();
     if (im == nullptr || im->channels != 3) {
@@ -1623,6 +1634,12 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   g.slg_start = req.slg_start;
   g.slg_stop = req.slg_stop;
   g.cfg_truncation = req.accel.cfg_truncation;
+  if (req.vision.guided()) {
+    g.vision_plain = true;
+    g.vision_weight = req.vision.weight;
+    g.vision_start = req.vision.start;
+    g.vision_stop = req.vision.stop;
+  }
   // Schedule (pipeline/samplers): the official one for kMoss, the scheduler's otherwise; the dataspace sampler's from its
   // step codes.
   const FlowSampling flow{req.shift, req.flow_multiplier};
@@ -1719,7 +1736,8 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
                                   "qwen3.5_9b_*.safetensors as text_encoder_file).");
     }
     for (const auto& im : req.vision.images) {
-      vision_images.push_back(qwen35_vision::prepare(*im, req.vision.max_pixels, req.vision.weight));
+      // The weight guides the sampling (Guidance::vision_weight): the pictures go in as they are.
+      vision_images.push_back(qwen35_vision::prepare(*im, req.vision.max_pixels, 1.0f));
       vision_patches += std::int64_t{vision_images.back().grid_h} * vision_images.back().grid_w;
     }
     const auto max_len = static_cast<std::size_t>(req.max_sequence_length);
@@ -1730,9 +1748,17 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
       seqs[1] = vision_prompts[1].ids;
     }
   }
+  // Vision guidance (weight, start, stop) also needs the prompt without the images: the last sequence.
+  std::size_t plain_index = 0;  // 0: none
+  if (g.vision_plain) {
+    plain_index = seqs.size();
+    seqs.push_back(tok::encode_moss_prompt(b.tokenizer, req.prompt, static_cast<std::size_t>(req.max_sequence_length)));
+    vision_prompts.emplace_back();
+  }
   tm.tokenize_s = since(t0);
   const std::int64_t sc = static_cast<std::int64_t>(seqs[0].size());
   const std::int64_t su = g.do_cfg() ? static_cast<std::int64_t>(seqs[1].size()) : 0;
+  const std::int64_t sp = plain_index != 0 ? static_cast<std::int64_t>(seqs[plain_index].size()) : 0;
   r.cond_tokens = static_cast<int>(sc);
   r.uncond_tokens = static_cast<int>(su);
 
@@ -1774,7 +1800,7 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   const moss_dit::FusedRouteSnapshot& route = dit_call.route;
 
   // Exact stack need of the phases this request runs, and the plan.
-  const std::vector<std::int64_t> row_lengths = denoise_row_lengths(sc, su, g);
+  const std::vector<std::int64_t> row_lengths = denoise_row_lengths(sc, su, g, sp);
   // The denoise phase of one pass at H x W (denoise_stack_bytes): the prompts' refined texts, the loop's buffers (P6b
   // step cache: its residual buffers sit below the forwards on the stack, for every distinct row of the loop) and the
   // forward for the loop's largest row set under this request's route and config.
@@ -1785,8 +1811,9 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
     d.width = W;
     d.texts = {sc};
     if (g.do_cfg()) d.texts.push_back(su);
+    if (plain_index != 0) d.texts.push_back(sp);
     d.rows = row_lengths;
-    d.loop_bytes = denoise_loop_bytes(lh, lw, sc, su, g, req.sampler) +
+    d.loop_bytes = denoise_loop_bytes(lh, lw, sc, su, g, req.sampler, sp) +
                    (req.accel.step_cache_on()
                         ? accel::FirstBlockCache::workspace_bytes(lh, lw, static_cast<int>(row_lengths.size()))
                         : 0);
@@ -1826,13 +1853,14 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   pc.width = W2;
   pc.text_lengths = {sc};
   if (g.do_cfg()) pc.text_lengths.push_back(su);
+  if (plain_index != 0) pc.text_lengths.push_back(sp);
   {
     // DiT evaluations (heun: 2 per step); the first pass of a hires fix counted at the target's cost by area.
     const double area = static_cast<double>(H1) * W1 / (static_cast<double>(H2) * W2);
     const int steps = (hires ? sched2.num_steps() : 0) + static_cast<int>(std::ceil(sched1.num_steps() * area));
     pc.steps = steps * model_calls_per_step(req.sampler);
   }
-  pc.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0);
+  pc.rows_per_step = 1 + (g.do_cfg() ? 1 : 0) + (g.slg_scale > 0 && g.slg_layers.any() ? 1 : 0) + (g.vision_two_rows() ? 1 : 0);
   if (refs_on) {
     pc.reference_tokens = ref_tokens;
     pc.reference_prefills = (sched1.num_steps() > 0 ? 1 : 0) + (hires && sched2.num_steps() > 0 ? 1 : 0);
@@ -2043,7 +2071,7 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
       e->hidden = qwen35_text::kHidden;
       e->data = std::move(out[k]);
       // The negative prompt (row 1) is kept: the usual empty one then never costs a pass again.
-      if (m.cache) m.cache->insert(keys[missing[k]], *e, missing[k] == 1);
+      if (m.cache) m.cache->insert(keys[missing[k]], *e, missing[k] == 1 && g.do_cfg());
       embeds[missing[k]] = std::move(e);
     }
   }
@@ -2127,9 +2155,13 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
     runtime::StackScope phase(*m.arena);
     const Tensor ref_c = m.arena->alloc_tensor(DType::kBF16, {sc, moss_dit::kDim});
     const Tensor ref_u = g.do_cfg() ? m.arena->alloc_tensor(DType::kBF16, {su, moss_dit::kDim}) : Tensor{};
+    const Tensor ref_p = plain_index != 0 ? m.arena->alloc_tensor(DType::kBF16, {sp, moss_dit::kDim}) : Tensor{};
     {
-      const Tensor refined[] = {ref_c, ref_u};
-      m.refine_texts(embeds, std::span<const Tensor>(refined, embeds.size()), tm);
+      // In the order of the sequences: cond, uncond under CFG, the plain prompt.
+      std::vector<Tensor> refined = {ref_c};
+      if (g.do_cfg()) refined.push_back(ref_u);
+      if (plain_index != 0) refined.push_back(ref_p);
+      m.refine_texts(embeds, refined, tm);
     }
 
     // P:400-402: fp32 CPU noise [1, 128, h, w].
@@ -2307,7 +2339,7 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
     int run = 0;
     try {
       sampler_options.seed = r.seed;
-      run = denoise(*m.dit, *m.arena, ref_c, ref_u, sched, g, req.sampler, sampler_options, latents, stream, on_step);
+      run = denoise(*m.dit, *m.arena, ref_c, ref_u, sched, g, req.sampler, sampler_options, latents, stream, on_step, ref_p);
     } catch (const moss_dit::Cancelled&) {
       // Inside a step's forward, before its update: the latents are those after the last finished step.
       r.cancelled = true;
@@ -2363,7 +2395,8 @@ Result Pipeline::run(const Request& request, const GenerateControl& control, boo
   // Compute and streaming rates from a single pass at one size (a hires fix's passes mix sizes).
   // Not from accelerated steps (P6b: cached / truncated steps are no measure of the DiT's rate).
   // Not from reference requests either (their prefill and extra attention are no measure of the plain step).
-  if (!hires && sched1.num_steps() > 0 && !req.accel.active(g.do_cfg()) && !refs_on) m.learn_from_denoise(r);
+  // A vision-guided run's rows change between steps: its step times do not teach the per-row cost.
+  if (!hires && sched1.num_steps() > 0 && !req.accel.active(g.do_cfg()) && !refs_on && !g.vision_plain) m.learn_from_denoise(r);
 
   // 5. Hires fix: decode the first pass, upscale it in pixel space, encode it at the target size, and refine it there.
   if (hires) {

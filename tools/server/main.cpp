@@ -412,18 +412,22 @@ class Params {
     return control_image_list(*v, std::string(key));
   }
   // `vision_references`: {"images": [path, ...] (1 to 4, in order), "max_pixels": integer (1024..4194304, optional),
-  // "weight": number (0..2, optional), "in_negative": bool (optional)}.
+  // "weight": number (0..2, optional), "start" / "stop": numbers (0..1, start <= stop, optional), "in_negative": bool
+  // (optional)}.
   struct VisionReferences {
     std::vector<std::string> images;
     std::optional<std::int64_t> max_pixels;
     std::optional<double> weight;
+    std::optional<double> start, stop;
     std::optional<bool> in_negative;
   };
   std::optional<VisionReferences> vision_references(std::string_view key) const {
     const Value* v = find(key);
     if (v == nullptr) return std::nullopt;
     const std::string k0(key);
-    if (!v->is_object()) throw bad(key, "an object {\"images\", \"max_pixels\"?, \"weight\"?, \"in_negative\"?}");
+    if (!v->is_object()) {
+      throw bad(key, "an object {\"images\", \"max_pixels\"?, \"weight\"?, \"start\"?, \"stop\"?, \"in_negative\"?}");
+    }
     VisionReferences r;
     bool have_images = false;
     for (const auto& [k, m] : v->as_object()) {
@@ -450,6 +454,11 @@ class Params {
         once(r.weight.has_value());
         if (!m.is_number() || !(m.as_double() >= 0 && m.as_double() <= 2)) throw bad(k0 + ".weight", "a number from 0 to 2");
         r.weight = m.as_double();
+      } else if (k == "start" || k == "stop") {
+        std::optional<double>& slot = k == "start" ? r.start : r.stop;
+        once(slot.has_value());
+        if (!m.is_number() || !(m.as_double() >= 0 && m.as_double() <= 1)) throw bad(k0 + "." + k, "a number from 0 to 1");
+        slot = m.as_double();
       } else if (k == "in_negative") {
         once(r.in_negative.has_value());
         if (!m.is_bool()) throw bad(k0 + ".in_negative", "a boolean");
@@ -459,6 +468,7 @@ class Params {
       }
     }
     if (!have_images) throw RequestError("invalid_params", "\"" + k0 + ".images\" is required");
+    if (r.start.value_or(0.0) > r.stop.value_or(1.0)) throw bad(k0 + ".start", "at most stop");
     return r;
   }
   // `references`: {"images": [path, ...] (1 or more, in order), "max_edge": integer (optional)}.
@@ -775,6 +785,7 @@ class Server {
            ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) + ",\"check\":" + tf(caps & MI_CAP_CHECK) +
            ",\"components\":" + tf(caps & MI_CAP_COMPONENTS) +
            ",\"vision_references\":" + tf(caps & MI_CAP_VISION_REFERENCES) +
+           ",\"vision_guidance\":" + tf(caps & MI_CAP_VISION_GUIDANCE) +
            "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
            ",\"driver_compatible\":" + tf(probe.driver_compatible) + ",\"device_count\":" + std::to_string(probe.device_count) +
@@ -1025,6 +1036,8 @@ class Server {
       g.vision_images_count = w->vision.size();
       if (r->max_pixels) g.vision_max_pixels = *r->max_pixels;
       if (r->weight) g.vision_weight = *r->weight;
+      if (r->start) g.vision_start = *r->start;
+      if (r->stop) g.vision_stop = *r->stop;
       if (r->in_negative) g.vision_in_negative = *r->in_negative ? 1 : 0;
     }
     if (const auto v = p.number("cfg_truncation")) g.cfg_truncation = *v;

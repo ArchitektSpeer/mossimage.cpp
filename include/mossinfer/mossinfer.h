@@ -161,6 +161,10 @@ MOSSINFER_API const char* mi_last_error_message(void);
  * so a reference image conditions the generation through the prompt, with no adapter. Needs a text encoder file that
  * carries the tower (Comfy-Org's qwen3.5_9b_*.safetensors). */
 #define MI_CAP_VISION_REFERENCES 0x200000u
+/* Vision guidance: mi_gen_params.vision_weight blends the predictions with and without the vision references, and
+ * vision_start / vision_stop (the 464-byte mi_gen_params) limit them to a window of the steps. A build with
+ * MI_CAP_VISION_REFERENCES but not this faded the images toward gray with vision_weight. */
+#define MI_CAP_VISION_GUIDANCE 0x400000u
 
 /* Bit set of MI_CAP_* features this build implements. */
 MOSSINFER_API uint32_t mi_capabilities(void);
@@ -662,10 +666,19 @@ typedef struct mi_gen_params {
   const mi_reference_image* vision_images;
   size_t vision_images_count;
   int64_t vision_max_pixels;   /* 0 (default) = 100000 (~90 prompt tokens); else 1024..4194304, never upscaled */
-  double vision_weight;        /* default 1; 0..2: below 1 fades the images toward gray (less influence), above 1 the
-                                * opposite; 0 drops them */
+  /* Default 1; 0..2 (MI_CAP_VISION_GUIDANCE): the cond prediction is plain + w * (with_images - plain), plain being the
+   * prompt without the images: 0 drops them, below 1 they pull less, above 1 more. Weights other than 0 and 1, and a
+   * window, encode the prompt once more without the images; a weight other than 0 and 1 runs a second cond row on
+   * the window's steps (with CFG a step takes about half as long again). Not with an SLG row or the step cache. */
+  double vision_weight;
   int32_t vision_in_negative;  /* 1: the negative prompt gets the images too (lessens their pull); default 0 */
   int32_t _reserved7;          /* must be 0 */
+  /* Fields after the 448-byte layout (MI_CAP_VISION_GUIDANCE). The steps the vision references guide, as fractions of
+   * the steps (step / steps, as slg_start): 0 <= vision_start <= vision_stop <= 1, default 0 and 1. Outside the window
+   * the prompt runs without the images. A later start leaves the composition to the prompt, the details to the
+   * images. */
+  double vision_start;
+  double vision_stop;
 } mi_gen_params;
 
 /* Fills the first `struct_size` bytes of `params` with the defaults. struct_size is sizeof(mi_gen_params) of the

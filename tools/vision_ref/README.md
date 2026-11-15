@@ -15,7 +15,7 @@ whether it is worth building.
 
 - **The sampling loop is `generate`'s.** With the engine's own `encode_text`, the image is bit-identical to `generate` with the same parameters.
 - **The reference encoder is right.** Its text-only conditioning (bf16 weights) drawn through the same loop gives an image within PSNR 30.1 dB of the engine's (INT8 activations): the expected precision gap, not a different model.
-- **A whole scene as the reference takes over the image.** A 1200×864 panel at 0.5 MP (494 image tokens against 25 prompt tokens) reproduced the panel's harbour, pose and paw prints and ignored the prompt's café, at image weight 1, 0.6 and 0.35 alike. Fading toward gray does not balance it.
+- **A whole scene as the reference takes over the image.** A 1200×864 panel at 0.5 MP (494 image tokens against 25 prompt tokens) reproduced the panel's harbour, pose and paw prints and ignored the prompt's café, at image weight 1, 0.6 and 0.35 alike. Fading toward gray does not balance it. The engine's `weight` therefore guides the sampling instead, between the predictions with and without the images ([c-api.md](../../docs/c-api.md#vision-references)).
 - **A character crop with few tokens carries the character, not the scene.** The same character cropped to the head and shoulders at 0.1 MP (100 image tokens): the prompt's café, window and book were drawn, with the reference's short black hair, round glasses and jacket. Text alone drew a different girl (long hair, no glasses).
 
 So the feature is worth building, for character references: a portrait crop and a small token budget (about 0.1 MP)

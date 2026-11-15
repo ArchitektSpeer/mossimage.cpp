@@ -611,6 +611,11 @@ pipeline::Request to_request(const mi_gen_params& p, fs::path* distill_time_embe
   if (p.vision_in_negative != 0 && p.vision_in_negative != 1) throw std::invalid_argument("vision_in_negative must be 0 or 1.");
   q.vision.max_pixels = p.vision_max_pixels != 0 ? p.vision_max_pixels : 100'000;
   q.vision.weight = static_cast<float>(p.vision_weight);
+  if (!(0.0 <= p.vision_start && p.vision_start <= p.vision_stop && p.vision_stop <= 1.0)) {
+    throw std::invalid_argument("vision_start and vision_stop must satisfy 0 <= vision_start <= vision_stop <= 1.");
+  }
+  q.vision.start = p.vision_start;
+  q.vision.stop = p.vision_stop;
   q.vision.in_negative = p.vision_in_negative == 1;
   for (std::size_t i = 0; i < p.vision_images_count; ++i) {
     const mi_reference_image& r = p.vision_images[i];
